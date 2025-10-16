@@ -3,7 +3,7 @@ IEEE SMCS SAR Competition Phase 1 Submission
 
 # Project README — Proposed Solution (ROSbot controller)
 
-This repository contains a Webots ROSbot controller implementing: robust CBF-based motion control, stuck detection & repulsive recovery, victim (dark-red) detection and victim-first mission handling, consensus navigation, map/GRAPH_SUMMARY merging, and supervisor/squad messaging. The main runnable file is `proposed_solution.py` (already provided).
+This repository provides a Webots ROSbot controller implementing a safety-centric multi-robot navigation framework. Key features include a control-barrier-function (CBF) based motion controller, robust stuck detection with repulsive recovery behaviors, prioritized victim detection and mission handling (color-based victim identification), consensus-driven rendezvous and navigation, persistent map and GRAPH_SUMMARY merging, and inter-robot/supervisor messaging. The primary entry point is proposed_solution.py.
 
 ---
 
