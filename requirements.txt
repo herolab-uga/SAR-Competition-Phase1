@@ -1,0 +1,6 @@
+# Python 3.10 recommended
+# Core deps used by proposed_solution.py
+numpy>=1.26,<3
+opencv-python>=4.8,<5
+Pillow>=10,<12
+matplotlib>=3.8,<4

@@ -1,0 +1,13 @@
+name: sar-controller
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - numpy>=1.26
+  - opencv
+  - pillow
+  - matplotlib
+  - pip
+  - pip:
+      # If you need extra pip-only packages, list here
+      # - some-pip-only-package==x.y.z
