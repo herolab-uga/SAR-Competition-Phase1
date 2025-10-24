@@ -1,7 +1,7 @@
 # merged_controller_opencv.py
 #
 # This controller integrates:
-# 1. Advanced Navigation (Rendezvous, Exploration) from proposed_solution_12.py
+# 1. Advanced Navigation (Rendezvous, Exploration) from proposed_solution.py
 # 2. Real OpenCV-based "Detect Red" logic.
 # 3. Real sensor methods from rosbot_sensors_actuators_example.py
 # 4. Supervisor reporting from simple_rosbot_sar 4.py (modified to not stop)
