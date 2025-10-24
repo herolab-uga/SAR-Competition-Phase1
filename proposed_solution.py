@@ -1,22 +1,31 @@
-# proposed_solution_fixed_stuck_with_victim_detection_consensus_timecycle.py
-# Revised controller:
-# - Victim-first policy: any red-victim sighting instantly cancels consensus and starts a victim mission
-# - Greedy pursuit fallback if depth/world is unavailable (pixel-centering drive)
-# - Time-based consensus cycle preserved, but preempted by victim missions
-# - Tight HSV for ONLY the provided dark red swatch (h≈2°, high S, low V)
-# - Preserves damping, smoothing, mapping, GRAPH_SUMMARY merging, short-range avoidance,
-#   hard barrier anti-stuck, repulsive recovery, and supervisor notification/backoff.
+# merged_controller_opencv.py
+#
+# This controller integrates:
+# 1. Advanced Navigation (Rendezvous, Exploration) from proposed_solution_12.py
+# 2. Real OpenCV-based "Detect Red" logic.
+# 3. Real sensor methods from rosbot_sensors_actuators_example.py
+# 4. Supervisor reporting from simple_rosbot_sar 4.py (modified to not stop)
+#
+# BEHAVIOR:
+# - Robot explores using advanced logic.
+# - When it detects a red blob:
+#   - It calculates the victim's world coordinates.
+#   - It immediately reports the victim to the supervisor (send_decision_request).
+#   - It immediately starts navigating toward the victim.
 
 import json
 import math
 import os
+import random
 import time
-import uuid
+import uuid  # Added for unique victim IDs
 from controller import Robot
 import numpy as np
 from PIL import Image
+from enum import Enum
+from typing import Tuple, List
 
-# optional OpenCV for robust RED blob detection/annotating
+# --- NEW: Added OpenCV dependency ---
 try:
     import cv2
     OPENCV_AVAILABLE = True
@@ -50,6 +59,12 @@ def _recursively_map(o, fn):
     return fn(o)
 
 
+class RobotState(Enum):
+    """Robot operational states (Only EXPLORING is used now)"""
+    EXPLORING = "exploring"
+    WAITING_APPROVAL = "waiting_approval"
+
+
 class Rosbot:
     def __init__(self):
         self.robot = Robot()
@@ -59,8 +74,20 @@ class Rosbot:
             self.name = self.robot.getName()
         except Exception:
             self.name = getattr(self.robot, "getName", lambda: "rosbot")()
+            
+        self.robot_id = self.name
+        
+        # State logic is kept for handle_supervisor_response, but not used to stop
+        self.state = RobotState.EXPLORING
+        self.action_pending = False
 
-        self.debug_dir = os.path.join(os.getcwd(), "example_camera_outputs")
+        self.last_decision_time = 0.0
+        self.decision_interval = 2.0
+
+        self.last_victim_report_time = 0.0
+        self.victim_report_cooldown = 10.0
+
+        self.debug_dir = os.path.join(os.getcwd(), "rgb_camera_outputs")
         os.makedirs(self.debug_dir, exist_ok=True)
 
         self.map_file = os.path.join(self.debug_dir, "map.json")
@@ -77,7 +104,7 @@ class Rosbot:
         self.current_victim_id = None
         self.post_detection_backoff_steps = 0
         self.post_detection_backoff_duration = 28
-        self.victim_target_tol_m = 1.0
+        self.victim_target_tol_m = 0.95
 
         # nodes (local map of discovered node centroids)
         self.nodes = {}
@@ -195,17 +222,23 @@ class Rosbot:
         self.assignment_delay = 3.0
 
         # speed / safety (tune as needed)
-        self.max_wheel_speed = 12.0
-        self.yaw_inversion = 1
-        self.d_min = 0.3
-        self.cbf_alpha = 30.5
-        self.omega_gain = -1.5
+        self.max_wheel_speed = 200.0
+        self.yaw_inversion = 0.1
+        self.d_min = 0.030
+        self.cbf_alpha = 5.0
+        self.omega_gain = 2.5
 
         # short-range safety thresholds (meters)
-        self.sr_stop_front = 0.28
-        self.sr_stop_rear = 0.28
-        self.sr_slow_front = 0.45
-        self.sr_slow_rear = 0.45
+        self.sr_stop_front = 0.05
+        self.sr_stop_rear = 0.05
+        self.sr_slow_front = 0.07
+        self.sr_slow_rear = 0.07
+
+        # safety trigger and percentile smoothing
+        self.cbf_trigger_distance = 0.1
+        self.cbf_allowed_percentile = 47
+        
+        self.victim_confidence_threshold = 0.001 
 
         # stuck/low-speed detection & recovery (tune)
         self.stuck_history_len = 12
@@ -213,9 +246,9 @@ class Rosbot:
         self.stuck_backoff_steps = 0
         self.emergency_backoff_steps = 0
         self.low_speed_count = 0
-        self.v_low_thresh = 0.18
+        self.v_low_thresh = 0.05
         self.low_speed_timeout_steps = 4
-        self.emergency_backoff_duration = 28
+        self.emergency_backoff_duration = 8
 
         self.debug_rate = 10
 
@@ -229,21 +262,21 @@ class Rosbot:
 
         # --- REPULSIVE mode parameters (safe defaults) ---
         self.repulsive_steps = 0
-        self.repulsive_duration = 28
-        self.repulsive_influence = 0.2
-        self.repulsive_max_v = 20.5
-        self.repulsive_max_omega = 10.2
-        self.repulsive_k_v = 10.0
-        self.repulsive_k_omega = 20.0
+        self.repulsive_duration = 4
+        self.repulsive_influence = 1.0
+        self.repulsive_max_v = 10.0
+        self.repulsive_max_omega = 10.0
+        self.repulsive_k_v = 4.0
+        self.repulsive_k_omega = 10
 
         # victim detection config
-        self.victim_check_interval = 5  # check every N steps
-        self.victim_area_thresh = 300   # pixels
-        self.victim_pixel_dedupe = 50   # px
-        self.victim_world_dedupe = 0.8  # m
+        self.victim_check_interval = 2  # check every N steps
+        self.victim_area_thresh = 300   # pixels (from proposed_solution)
+        self.victim_pixel_dedupe = 50   # px (from proposed_solution)
+        self.victim_world_dedupe = 0.8  # m (from proposed_solution)
         self.victim_next_id = 1
 
-        # --- Consensus / pose broadcast parameters ---
+        # pose broadcast / received poses
         self.pose_bcast_interval_s = 0.5
         try:
             self.pose_bcast_steps = max(1, int(self.pose_bcast_interval_s * 1000.0 / float(self.timestep)))
@@ -252,78 +285,58 @@ class Rosbot:
         self.last_pose_bcast = 0
         self.received_poses = {}  # robot_name -> (x,y,ts)
 
-        # Startup window
+        # Startup / rendezvous window (first N seconds we do rendezvous)
         self.start_time = now_ts()
-        self.startup_window_s = 15.0
-        self.startup_window_end = self.start_time + self.startup_window_s
-        self.startup_consensus_done = False
+        self.rendezvous_window_s = 200.0
+        self.rendezvous_reached = False
 
-        # consensus defaults
-        self.consensus_target = None
-        self.consensus_tolerance = 0.6
-        self.consensus_min_robots = 2
-        self.consensus_active = False
-        self.consensus_timeout_s = 12.0
-        self.consensus_started_ts = None
-
-        # if GPS available, add our own pose
-        pos = self.get_position()
-        if pos is not None:
-            self.received_poses[self.name] = (float(pos[0]), float(pos[1]), now_ts())
-
-        # --- angular scaling / smoothing ---
-        self.omega_scale = 0.6
-        self.omega_limit = 4.0
-        self.omega_smooth_alpha = 0.65
+        # smoothing / angular limits
+        self.omega_scale = 1
+        self.omega_limit = 4
+        self.omega_smooth_alpha = 0.5 # (0.0 = instant, 1.0 = no change). 0.8 is smooth.
         self.prev_omega = 0.0
         self.heading_deadzone_rad = math.radians(6.0)
 
-        # consensus cycle mode (None / 'forward' / 'reverse')
-        self.consensus_motion_mode = None
-        self.consensus_cycle_total = 34.0   # 15 + 2 + 15 + 2 = 34s cycle
-        self.consensus_inactive_grace_s = 2.0
-        self.consensus_inactive_since = None
+        self.v_smooth_alpha = 0.8  # (0.0 = instant, 1.0 = no change). 0.8 is smooth.
+        self.prev_v = 0.0
 
         # GREEDY pixel-centering pursuit (fallback when no depth/world)
         self.greedy_active = False
         self.greedy_target_px = None
         self.greedy_last_seen_ts = 0.0
-        self.greedy_timeout_s = 4.0  # give up if not updated
+        self.greedy_timeout_s = 4.0
 
-        # ---- Narrow HSV ranges for ONLY the given dark red swatch ----
-        # Image analysis of swatch (HSV, OpenCV scale H:0..179) -> H≈2, S≈241, V≈74.
-        # We set tight windows with a little tolerance and wrap handling.
+        # Narrow HSV ranges for RED (from proposed_solution)
         self.hsv_narrow_ranges = [
-            (np.array([0,   200, 40], dtype=np.uint8),  np.array([6,   255, 130], dtype=np.uint8)),   # near H=2
-            (np.array([175, 200, 40], dtype=np.uint8),  np.array([179, 255, 130], dtype=np.uint8)),   # wrap end, narrow
+            (np.array([0,   200, 40], dtype=np.uint8),  np.array([6,   255, 130], dtype=np.uint8)),
+            (np.array([175, 200, 40], dtype=np.uint8),  np.array([179, 255, 130], dtype=np.uint8)),
         ]
 
+        # --- NEW: Check for OpenCV ---
         if not OPENCV_AVAILABLE:
-            print(f"[{self.name}] Warning: OpenCV not available — red victim detection disabled. Install opencv-python to enable.")
+            print(f"[{self.name}] CRITICAL: OpenCV not available. Red detection will be disabled.")
+        else:
+            print(f"[{self.name}] OpenCV is available. Red detection enabled.")
+        # --- END NEW ---
 
-    # ---------- Consensus cycle helper ----------
-    def update_consensus_cycle(self):
-        """
-        Cycle: 0-15s -> forward_active
-               15-17s -> inactive (short)
-               17-32s -> reverse_active
-               32-34s -> inactive (short)
-        Repeats every 34s. (active most of the time)
-        """
-        try:
-            elapsed = now_ts() - self.start_time
-            cycle = self.consensus_cycle_total
-            t = elapsed % cycle
-            if t < 12:
-                return "forward_active"
-            elif t < 17.0:
-                return "inactive"
-            elif t < 20.0:
-                return "reverse_active"
-            else:
-                return "inactive"
-        except Exception:
-            return "inactive"
+        # If GPS available, add our own pose as initial
+        pos = self.get_position()
+        if pos is not None:
+            self.received_poses[self.name] = (float(pos[0]), float(pos[1]), now_ts())
+
+        # -------------------------------
+        # Exploration-sharing parameters
+        # -------------------------------
+        self.cell_size = 1
+        self.explore_mark_radius = 20
+        self.explored_cells = {}
+        self.remote_explored = {}
+        self.explored_ttl = 1000.0
+        self.explored_bcast_interval_s = 1.0
+        self.last_explored_bcast = 0.0
+        self.explored_bcast_max = 600
+        
+        print(f"[{self.robot_id}] Initialized - Ready for search and rescue mission")
 
 
     # ---------- Victim persistence ----------
@@ -429,6 +442,130 @@ class Rosbot:
             print(f"[{self.name}] Error send_supervisor_message: {ex}")
             return False
 
+    # ---------- Explored-area helpers ----------
+    def world_to_cell(self, world_xy):
+        try:
+            ix = int(math.floor(world_xy[0] / float(self.cell_size)))
+            iy = int(math.floor(world_xy[1] / float(self.cell_size)))
+            return (ix, iy)
+        except Exception:
+            return None
+
+    def cell_to_world_center(self, cell):
+        ix, iy = cell
+        cx = (ix + 0.5) * self.cell_size
+        cy = (iy + 0.5) * self.cell_size
+        return (cx, cy)
+
+    def mark_explored_world_area(self, world_xy, radius=None):
+        try:
+            if world_xy is None:
+                return
+            if radius is None:
+                radius = self.explore_mark_radius
+            cx = world_xy[0]
+            cy = world_xy[1]
+            r = float(radius)
+            min_ix = int(math.floor((cx - r) / self.cell_size))
+            max_ix = int(math.floor((cx + r) / self.cell_size))
+            min_iy = int(math.floor((cy - r) / self.cell_size))
+            max_iy = int(math.floor((cy + r) / self.cell_size))
+            ts = now_ts()
+            for ix in range(min_ix, max_ix + 1):
+                for iy in range(min_iy, max_iy + 1):
+                    cell_center = self.cell_to_world_center((ix, iy))
+                    if math.hypot(cell_center[0] - cx, cell_center[1] - cy) <= r:
+                        self.explored_cells[(ix, iy)] = ts
+        except Exception as ex:
+            print(f"[{self.name}] Error mark_explored_world_area: {ex}")
+
+    def expire_old_explored(self):
+        try:
+            now = now_ts()
+            to_del = [c for c,ts in self.explored_cells.items() if (now - ts) > self.explored_ttl]
+            for c in to_del:
+                del self.explored_cells[c]
+            # expire remote ones too
+            for rname in list(self.remote_explored.keys()):
+                for c, ts in list(self.remote_explored[rname].items()):
+                    if now - ts > self.explored_ttl:
+                        try:
+                            del self.remote_explored[rname][c]
+                        except Exception:
+                            pass
+                if not self.remote_explored[rname]:
+                    try:
+                        del self.remote_explored[rname]
+                    except Exception:
+                        pass
+        except Exception as ex:
+            print(f"[{self.name}] Error expire_old_explored: {ex}")
+
+    def get_combined_explored(self):
+        combined = set(self.explored_cells.keys())
+        for rmap in self.remote_explored.values():
+            combined.update(rmap.keys())
+        return combined
+
+    def find_nearest_unexplored_cell(self, max_radius_cells=50):
+        pos = self.get_position()
+        if pos is None:
+            return None
+        center_cell = self.world_to_cell(pos)
+        if center_cell is None:
+            return None
+        combined = self.get_combined_explored()
+        if center_cell not in combined:
+            return center_cell
+        cx, cy = center_cell
+        for r in range(1, max_radius_cells+1):
+            for dx in range(-r, r+1):
+                for dy in (-r, r):
+                    cell = (cx + dx, cy + dy)
+                    if cell not in combined:
+                        return cell
+            for dy in range(-r+1, r):
+                for dx in (-r, r):
+                    cell = (cx + dx, cy + dy)
+                    if cell not in combined:
+                        return cell
+        return None
+
+    def broadcast_explored_update(self):
+        try:
+            now = now_ts()
+            items = sorted(self.explored_cells.items(), key=lambda kv: kv[1], reverse=True)
+            items = items[:self.explored_bcast_max]
+            cells_payload = [{"cell": [int(k[0]), int(k[1])], "ts": float(v)} for k, v in items]
+            payload = {"type": "EXPLORED_UPDATE", "robot": self.name, "cells": cells_payload, "ts": now}
+            self.send_squad_message(payload)
+            self.last_explored_bcast = now
+            if self.step_count % (self.debug_rate*5) == 0:
+                print(f"[{self.name}] Broadcasted {len(cells_payload)} explored cells")
+            return True
+        except Exception as ex:
+            print(f"[{self.name}] Error broadcast_explored_update: {ex}")
+            return False
+
+    def merge_remote_explored(self, robot_name, cells_list):
+        try:
+            if robot_name not in self.remote_explored:
+                self.remote_explored[robot_name] = {}
+            changed = 0
+            for c in cells_list:
+                cell = tuple(int(x) for x in c.get("cell", []))
+                ts = float(c.get("ts", now_ts()))
+                prev = self.remote_explored[robot_name].get(cell)
+                if (prev is None) or (ts > prev):
+                    self.remote_explored[robot_name][cell] = ts
+                    changed += 1
+            if changed and self.step_count % (self.debug_rate*5) == 0:
+                print(f"[{self.name}] Merged {changed} remote explored cells from {robot_name}")
+            return True
+        except Exception as ex:
+            print(f"[{self.name}] Error merge_remote_explored: {ex}")
+            return False
+
     # ---------- Motors ----------
     def set_wheel_speeds(self, fl=0.0, fr=0.0, rl=0.0, rr=0.0):
         if self.motors.get("fl"):
@@ -439,18 +576,31 @@ class Rosbot:
             self.motors["rl"].setVelocity(rl)
         if self.motors.get("rr"):
             self.motors["rr"].setVelocity(rr)
+            
+    def stop(self):
+        """Stop robot movement"""
+        self.set_wheel_speeds(0, 0, 0, 0)
 
     # ---------- Wheel mapping helper (damping & scaling) ----------
     def _apply_wheel_cmds(self, v_safe, omega_safe):
         """Convert v_safe and omega_safe into left/right wheel velocities with smoothing and limits."""
         try:
+            # --- This is your existing angular smoothing ---
             omega_scaled = float(omega_safe) * self.omega_scale
             omega_scaled = self._clip(omega_scaled, -self.omega_limit, self.omega_limit)
             omega_cmd = self.prev_omega * self.omega_smooth_alpha + omega_scaled * (1.0 - self.omega_smooth_alpha)
             self.prev_omega = omega_cmd
 
-            left = self._clip(v_safe - omega_cmd, -self.max_wheel_speed, self.max_wheel_speed)
-            right = self._clip(v_safe + omega_cmd, -self.max_wheel_speed, self.max_wheel_speed)
+            # --- ADD THIS BLOCK: Linear (forward) smoothing ---
+            v_cmd = self.prev_v * self.v_smooth_alpha + v_safe * (1.0 - self.v_smooth_alpha)
+            self.prev_v = v_cmd
+            # --- END ADD ---
+
+            # --- MODIFIED: Use v_cmd instead of v_safe ---
+            left = self._clip(v_cmd - omega_cmd, -self.max_wheel_speed, self.max_wheel_speed)
+            right = self._clip(v_cmd + omega_cmd, -self.max_wheel_speed, self.max_wheel_speed)
+            # --- END MODIFIED ---
+            
             self.set_wheel_speeds(left, right, left, right)
         except Exception as ex:
             print(f"[{self.name}] Error _apply_wheel_cmds: {ex}")
@@ -460,6 +610,28 @@ class Rosbot:
                 pass
 
     # ---------- Sensors shortcuts ----------
+
+    # --- NEW: Added from rosbot_sensors_actuators_example.py ---
+    def get_rgb_image(self):
+        if not self.camera_rgb:
+            return None
+        buf = self.camera_rgb.getImage()
+        w, h = self.camera_rgb.getWidth(), self.camera_rgb.getHeight()
+        # Webots stores camera images as BGRA
+        img = np.frombuffer(buf, dtype=np.uint8).reshape((h, w, 4))
+        rgb = img[:, :, :3][:, :, ::-1]  # convert BGRA->RGB
+        return rgb
+
+    def get_depth_image(self):
+        if not self.camera_depth:
+            return None
+        w, h = self.camera_depth.getWidth(), self.camera_depth.getHeight()
+        depth = np.array(self.camera_depth.getRangeImage(), dtype=np.float32).reshape(
+            (h, w)
+        )
+        return depth
+    # --- END NEW ---
+
     def get_lidar_ranges(self):
         if not self.lidar:
             return None
@@ -468,11 +640,39 @@ class Rosbot:
         except Exception:
             return None
 
+    def get_depth_scan_ranges(self, num_rows_to_average=5):
+        """
+        Gets a 1D scan from the depth camera by sampling the middle rows.
+        Returns a 1D numpy array of distances, or None.
+        """
+        if not self.camera_depth:
+            return None
+        
+        depth_image = self.get_depth_image() # This is (h, w)
+        if depth_image is None:
+            return None
+        
+        h, w = depth_image.shape
+        
+        # --- START MODIFICATION ---
+        # Select ONLY the middle row. This is less likely to see the floor
+        # than taking the 'min' of a wide band.
+        mid_row = h // 2
+        
+        if h > 0:
+            horizontal_slice = depth_image[mid_row, :]
+        else:
+            return None
+        # --- END MODIFICATION ---
+        
+        # Return this 1D array
+        return horizontal_slice
+    
     def get_position(self):
         if not self.gps:
             return None
         try:
-            vals = self.gps.getValues()  # [x, y, z] - use x and z as ground-plane coords
+            vals = self.gps.getValues()
             return (float(vals[0]), float(vals[2]))
         except Exception:
             return None
@@ -551,9 +751,20 @@ class Rosbot:
         except Exception:
             return None
 
+    def _depth_camera_angles(self):
+        """Get the horizontal angles for each pixel column of the depth camera."""
+        if not self.camera_depth:
+            return None
+        try:
+            n = self.camera_depth.getWidth()
+            fov = self.camera_depth.getFov()
+            # Create an array of angles, just like for the lidar
+            return np.linspace(-fov/2.0, fov/2.0, n)
+        except Exception:
+            return None
+        
     # ---------- Short-range helper ----------
     def get_short_range_values(self):
-        """Returns dict with distances (meters) or np.inf if sensor absent."""
         vals = {}
         name_map = {"fl": "fl_range", "fr": "fr_range", "rl": "rl_range", "rr": "rr_range"}
         for k, devname in name_map.items():
@@ -574,9 +785,8 @@ class Rosbot:
             if cam is None or depth_val is None or not np.isfinite(depth_val):
                 return None
             w = cam.getWidth()
-            fov = cam.getFov()  # horizontal FOV (rad)
+            fov = cam.getFov()
             cx = w / 2.0
-            # bearing relative to camera center
             bearing = (px - cx) / float(w) * fov
             yaw = self.get_yaw()
             pos = self.get_position()
@@ -584,73 +794,146 @@ class Rosbot:
                 return None
             world_heading = yaw + bearing
             r = float(depth_val)
-            wx = pos[0] + r * math.cos(world_heading)
-            wy = pos[1] + r * math.sin(world_heading)
+            # Add small offset to not target *inside* the wall
+            r_safe = r - 0.15 
+            wx = pos[0] + r_safe * math.cos(world_heading)
+            wy = pos[1] + r_safe * math.sin(world_heading)
             return (float(wx), float(wy))
         except Exception:
             return None
 
-    def handle_supervisor_response(self, msg):
-        """
-        Process a parsed supervisor message `msg`.
-        If the supervisor explicitly rejects an action for this robot
-        (approved == False and robot matches self.name), we:
-          - log the rejection in map history
-          - abort the current task / consensus navigation
-          - trigger emergency backoff so the robot moves away safely
-          - send a mission report explaining the state
-        If approved, we log approval.
-        """
+    # --- START: Supervisor comms logic from simple_rosbot_sar 4.py ---
+    def handle_supervisor_response(self):
+        """Handle response from supervisor"""
+        while self.supervisor_receiver.getQueueLength() > 0:
+            message = ""
+            try:
+                if hasattr(self.supervisor_receiver, "getString"):
+                    message = self.supervisor_receiver.getString()
+                else:
+                    message_bytes = self.supervisor_receiver.getData()
+                    message = message_bytes.decode("utf-8")
+            except Exception as e:
+                print(f"[{self.robot_id}] Error reading supervisor message: {e}")
+                self.supervisor_receiver.nextPacket()
+                continue
+                
+            self.supervisor_receiver.nextPacket()
+
+            try:
+                response = json.loads(message)
+                approved = response.get("approved", False)
+                message_target = response.get("robot_id", None)
+                
+                if message_target and message_target != self.robot_id:
+                    print(
+                        f"Ignoring message for a different robot {message_target, self.robot_id}"
+                    )
+                    continue
+
+                if approved:
+                    print(f"[{self.robot_id}] Supervisor APPROVED action.")
+                    self.action_pending = False
+                    self.state = RobotState.EXPLORING
+                    return True # Approved
+                else:
+                    print(f"[{self.robot_id}] Supervisor REJECTED action.")
+                    self.action_pending = False
+                    self.state = RobotState.EXPLORING
+                    # --- MODIFICATION: If rejected, add emergency backoff ---
+                    self.emergency_backoff_steps = max(self.emergency_backoff_steps, self.emergency_backoff_duration)
+                    # --- END MODIFICATION ---
+                    return False # Rejected
+
+            except json.JSONDecodeError:
+                print(f"[{self.robot_id}] Error decoding supervisor response: {message}")
+            except Exception as e:
+                print(f"[{self.robot_id}] Error processing supervisor response: {e}")
+
+        return None  # No response processed
+    
+    def generate_explanation(self, action: str) -> str:
+        """Generate human-readable explanation for the intended action"""
+        pos = self.get_position()
+        pos_str = "unknown"
+        if pos:
+             pos_str = f"{pos[0]:.1f}, {pos[1]:.1f}"
+
+        explanations = {
+            "investigate_victim": [
+                f"Moving to investigate potential victim detected near {pos_str}",
+                f"Approaching suspected victim location for detailed assessment",
+                f"Detected red object, investigating potential victim.",
+            ],
+            "explore_forward": [
+                f"Moving forward to explore uncharted territory at coordinates {pos_str}",
+                "Proceeding ahead to systematically search for victims in this area",
+                "Continuing forward exploration to maximize coverage of the search zone",
+            ],            "return_to_rendezvous": [
+                f"Returning to rendezvous point to regroup with squad",
+                f"Heading back to rendezvous location for team coordination",
+                f"Navigating to rendezvous point to ensure team safety and communication",
+            ],
+        }
+        if action in explanations:
+            explanation = random.choice(explanations[action])
+        else:
+            explanation = f"Executing {action} to continue search and rescue mission"
+        return explanation
+
+    # --- MODIFIED: Added wait_for_approval flag ---
+    def send_decision_request(
+        self,
+        action: str,
+        reason: str,
+        victim_detected: bool = False,
+        confidence: float = 0.0,
+        wait_for_approval: bool = True  # <-- NEW FLAG
+    ):
+        """Send decision request to supervisor"""
+        if not self.supervisor_emitter:
+            print(f"[{self.robot_id}] Warning: Cannot send request - no emitter")
+            if wait_for_approval:
+                self.state = RobotState.WAITING_APPROVAL
+            return
+
+        pos = self.get_position()
+        pos_list = [pos[0], 0.0, pos[1]] if pos else [0.0, 0.0, 0.0] 
+
+        request = {
+            "timestamp": self.robot.getTime(),
+            "robot_id": self.robot_id,
+            "position": pos_list,
+            "intended_action": action,
+            "reason": reason,
+            "victim_found": victim_detected,
+            "victim_confidence": confidence,
+        }
+
+        message = json.dumps(request)
+        
         try:
-            if not isinstance(msg, dict):
-                return
-            # message may use "robot" or "robot_id"
-            target = msg.get("robot") or msg.get("robot_id")
-            # only act on messages addressed to this robot (or broadcast with no robot specified)
-            if target and str(target) != str(self.name):
-                return
-            approved = msg.get("approved", None)
-            if approved is False:
-                # supervisor denied an action — ensure we safely abort and report
-                self._append_map_history("supervisor_reject", {"msg": msg})
-                # abort tasks (consensus + navigation)
-                if self.current_task:
-                    self._append_map_history("abort_task", {"task": self.current_task})
-                self.current_task = None
-                self.task_target = None
-                # cancel consensus if any
-                self.consensus_active = False
-                self.consensus_target = None
-                self.consensus_motion_mode = None
-                # trigger emergency backoff to avoid dangerous follow-through
-                self.emergency_backoff_steps = max(self.emergency_backoff_steps, self.emergency_backoff_duration)
-                # persist & broadcast a mission report describing the rejection
-                try:
-                    reason = msg.get("reason", "supervisor_rejected_action")
-                    self.send_mission_report(reason=reason, rejected=True, supervisor_msg=msg)
-                except Exception:
-                    pass
-                # also inform teammates briefly
-                try:
-                    self.send_squad_message({"type":"SUPERVISOR_REJECT","robot":self.name,"reason":str(msg.get("reason","")),"ts": now_ts()})
-                except Exception:
-                    pass
-                print(f"[{self.name}] Supervisor rejected action -> aborting tasks, backoff set({self.emergency_backoff_steps})")
-            elif approved is True:
-                self._append_map_history("supervisor_approve", {"msg": msg})
-                # optionally, you could resume or mark the last proposal accepted.
-                print(f"[{self.name}] Supervisor approved action.")
+            if hasattr(self.supervisor_emitter, "sendString"):
+                self.supervisor_emitter.sendString(message)
             else:
-                # generic supervisor message (not approval/rejection) -> just log it
-                self._append_map_history("supervisor_message", {"msg": msg})
-        except Exception as ex:
-            print(f"[{self.name}] Error handle_supervisor_response: {ex}")
+                self.supervisor_emitter.send(message.encode("utf-8"))
+        except Exception as e:
+             print(f"[{self.robot_id}] Error sending decision request: {e}")
+
+        # --- MODIFIED: Only wait if flag is True ---
+        if wait_for_approval:
+            self.action_pending = True
+            self.state = RobotState.WAITING_APPROVAL
+        # --- END MODIFICATION ---
+
+        print(f"[{self.robot_id}] REQUEST: {action} - {reason}")
+        if victim_detected:
+            print(f"[{self.robot_id}] VICTIM ALERT: Confidence {confidence:.1%}")
+    # --- END: Supervisor comms logic ---
+
 
     def send_mission_report(self, reason="status_update", rejected=False, supervisor_msg=None):
-        """
-        Compile a concise mission report and send/persist it.
-        Contains: robot name, timestamp, position, current task, victims (brief), known nodes (brief), rejected flag, supervisor_msg (if any).
-        """
+        # This function is from proposed_solution, it's fine
         try:
             pos = self.get_position()
             victims_list = []
@@ -662,6 +945,15 @@ class Rosbot:
                     "last_seen": info.get("last_seen"),
                 })
             nodes_list = [{"id": nid, "centroid": c} for nid, c in list(self.nodes.items())][:50]
+            
+            metrics_payload = {
+                "victims_seen": len(self.red_victims),
+                "victims_confirmed": len(self.visited_victims),
+                "false_positives": 0, # This logic isn't fully implemented
+                "distance_m": 0.0,
+                "avg_detection_time_s": None,
+            }
+            
             report = {
                 "type": "MISSION_REPORT",
                 "robot": self.name,
@@ -674,11 +966,11 @@ class Rosbot:
                 "nodes_sample": nodes_list,
                 "rejected": bool(rejected),
                 "reason": reason,
-                "supervisor_msg": supervisor_msg
+                "supervisor_msg": supervisor_msg,
+                "metrics": metrics_payload
             }
-            # persist small report in history file
+
             self._append_map_history("mission_report", report)
-            # send to supervisor/emitter if available, otherwise to squad as fallback
             if self.supervisor_emitter:
                 try:
                     raw = safe_json_dumps(report)
@@ -686,14 +978,13 @@ class Rosbot:
                         self.supervisor_emitter.sendString(raw)
                     else:
                         self.supervisor_emitter.send(raw.encode("utf-8"))
-                    print(f"[{self.name}] Sent mission report to supervisor.")
+                    # print(f"[{self.name}] Sent mission report to supervisor.")
                     return True
                 except Exception:
                     pass
-            # fallback to squad broadcast
             try:
                 self.send_squad_message(report)
-                print(f"[{self.name}] Broadcasted mission report to squad (fallback).")
+                # print(f"[{self.name}] Broadcasted mission report to squad (fallback).")
                 return True
             except Exception:
                 pass
@@ -702,172 +993,176 @@ class Rosbot:
             print(f"[{self.name}] Error send_mission_report: {ex}")
             return False
 
-    # ---------- RED Victim detection (OpenCV, very narrow range) ----------
-    def detect_red_victims(self, step_count):
+    # --- NEW: Replaced detect_victim with OpenCV version ---
+    # --- NEW: Replaced detect_victim with OpenCV version ---
+    def detect_victim(self):
         """
-        Returns list of detections: [(id, cx, cy, bbox(x,y,w,h), world_xy_or_None, 'red')]
-        dedupes with existing victims. Uses tight HSV windows around the provided red swatch.
+        Detects RED victims using OpenCV, estimates world position.
+        Updates self.red_victims internally.
+        SAVES a copy of the detection image to self.debug_dir.
+        Returns a list of detection dicts for use in the main loop.
         """
-        if not OPENCV_AVAILABLE or self.camera_rgb is None:
+        if not OPENCV_AVAILABLE or self.camera_rgb is None or self.camera_depth is None:
             return []
+
+        rgb_image = self.get_rgb_image()
+        depth_image = self.get_depth_image()
+        if rgb_image is None or depth_image is None:
+            return []
+
+        h, w, _ = rgb_image.shape
+        detections_list = [] # For return value
 
         try:
-            buf = self.camera_rgb.getImage()
-            w, h = self.camera_rgb.getWidth(), self.camera_rgb.getHeight()
-            img = np.frombuffer(buf, dtype=np.uint8).reshape((h, w, 4))
-            bgr = img[:, :, :3].copy()  # BGRA -> BGR
-            hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+            # 1. Convert to HSV
+            hsv = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2HSV)
 
-            # Combine the two tight windows (with wrap)
-            masks = []
-            for lo, hi in self.hsv_narrow_ranges:
-                masks.append(cv2.inRange(hsv, lo, hi))
-            mask = masks[0]
-            for m in masks[1:]:
-                mask = cv2.bitwise_or(mask, m)
+            # 2. Create mask for red (using ranges from __init__)
+            mask = cv2.inRange(hsv, self.hsv_narrow_ranges[0][0], self.hsv_narrow_ranges[0][1])
+            mask2 = cv2.inRange(hsv, self.hsv_narrow_ranges[1][0], self.hsv_narrow_ranges[1][1])
+            red_mask = cv2.bitwise_or(mask, mask2)
 
-            # Morphology cleanup (light touch to keep small blobs)
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+            # 3. Find contours
+            contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            detections = []
-            annotated = bgr.copy()
+            if not contours:
+                return []
 
-            depth_arr = None
-            if self.camera_depth:
-                try:
-                    d = np.array(self.camera_depth.getRangeImage(), dtype=np.float32)
-                    depth_arr = d.reshape((self.camera_depth.getHeight(), self.camera_depth.getWidth()))
-                except Exception:
-                    depth_arr = None
+            # 4. Find the largest contour
+            largest_contour = max(contours, key=cv2.contourArea)
+            area = cv2.contourArea(largest_contour)
 
-            for cnt in contours:
-                area = cv2.contourArea(cnt)
-                if area < self.victim_area_thresh:
-                    continue
-                x, y, wbox, hbox = cv2.boundingRect(cnt)
-                cx = int(x + wbox / 2.0)
-                cy = int(y + hbox / 2.0)
+            if area < self.victim_area_thresh: # Use threshold from __init__
+                return [] # No significant blob found
 
-                world_pos = None
-                depth_val = None
-                if depth_arr is not None:
-                    try:
-                        dh, dw = depth_arr.shape
-                        sx = int(cx * (dw / float(bgr.shape[1])))
-                        sy = int(cy * (dh / float(bgr.shape[0])))
-                        sx = np.clip(sx, 0, dw-1)
-                        sy = np.clip(sy, 0, dh-1)
-                        depth_val = float(depth_arr[sy, sx])
-                        if np.isfinite(depth_val) and depth_val > 0.05:
-                            world_pos = self._pixel_to_world_approx(cx, cy, depth_val)
-                    except Exception:
-                        world_pos = None
+            # 5. Get centroid
+            M = cv2.moments(largest_contour)
+            if M["m00"] == 0:
+                return []
+            
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
+            
+            # --- START: SAVE DETECTION IMAGE (NEW CODE) ---
+            try:
+                # 1. Create a BGR copy for drawing (OpenCV expects BGR)
+                bgr_image = cv2.cvtColor(rgb_image.copy(), cv2.COLOR_RGB2BGR)
+                
+                # 2. Draw a green circle on the detected centroid
+                cv2.circle(bgr_image, (cx, cy), 10, (0, 255, 0), 2) # (0, 255, 0) is green in BGR
+                
+                # 3. Convert back to RGB for saving with PIL
+                rgb_to_save = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
+                
+                # 4. Convert to PIL Image
+                pil_img = Image.fromarray(rgb_to_save)
+                
+                # 5. Create a unique filename and save
+                ts = int(now_ts() * 1000)
+                filename = f"detection_{self.name}_{ts}_at_({cx},{cy}).png"
+                path = os.path.join(self.debug_dir, filename)
+                pil_img.save(path)
+                
+            except Exception as e:
+                print(f"[{self.name}] Failed to save detection image: {e}")
+            # --- END: SAVE DETECTION IMAGE (NEW CODE) ---
 
-                # Dedupe with existing victims
-                found_same = None
-                for vid, info in self.victims.items():
-                    ipx = info.get("pixel", {}).get("x")
-                    ipy = info.get("pixel", {}).get("y")
-                    if ipx is not None and ipy is not None:
-                        if math.hypot(ipx - cx, ipy - cy) < self.victim_pixel_dedupe:
-                            found_same = vid
+
+            # 6. Get depth and world coordinates
+            cx = np.clip(cx, 0, w - 1)
+            cy = np.clip(cy, 0, h - 1)
+
+            depth_val = float(depth_image[cy, cx])
+            
+            world_coords = None
+            if np.isfinite(depth_val) and depth_val > self.camera_depth.getMinRange():
+                world_coords = self._pixel_to_world_approx(cx, cy, depth_val)
+
+            # 7. Add to self.red_victims (with deduplication)
+            now = now_ts()
+            is_new = True
+            found_vid = None
+            
+            if world_coords:
+                for vid, v_info in self.red_victims.items():
+                    if v_info.get("world"):
+                        dist = math.hypot(v_info["world"][0] - world_coords[0], v_info["world"][1] - world_coords[1])
+                        if dist < self.victim_world_dedupe:
+                            is_new = False
+                            found_vid = vid
                             break
-                    if world_pos and info.get("world"):
-                        try:
-                            wx, wy = info["world"]
-                            if math.hypot(wx - world_pos[0], wy - world_pos[1]) < self.victim_world_dedupe:
-                                found_same = vid
-                                break
-                        except Exception:
-                            pass
+            else:
+                for vid, v_info in self.red_victims.items():
+                    if v_info.get("pixel"):
+                        pix_dist = math.hypot(v_info["pixel"]["x"] - cx, v_info["pixel"]["y"] - cy)
+                        if pix_dist < self.victim_pixel_dedupe:
+                            is_new = False
+                            found_vid = vid
+                            break
+            
+            detection_info = {
+                "pixel": {"x": cx, "y": cy},
+                "world": world_coords,
+                "last_seen": now,
+                "confidence": 0.9
+            }
 
-                if found_same:
-                    self.victims[found_same]["last_seen"] = now_ts()
-                    self.victims[found_same]["color"] = "red"
-                    if world_pos and not self.victims[found_same].get("world"):
-                        self.victims[found_same]["world"] = world_pos
-                    cv2.rectangle(annotated, (x, y), (x + wbox, y + hbox), (0, 165, 255), 2)
-                    cv2.putText(annotated, f"victim:{found_same[:6]}", (x, y-6),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
-                    detections.append((found_same, cx, cy, (x, y, wbox, hbox),
-                                       self.victims[found_same].get("world"), "red"))
-                    vid_to_use = found_same
-                else:
-                    vid = f"rv-{uuid.uuid4().hex[:8]}"
-                    info = {
-                        "id": vid,
-                        "first_seen": now_ts(),
-                        "last_seen": now_ts(),
-                        "pixel": {"x": int(cx), "y": int(cy), "w": int(wbox), "h": int(hbox)},
-                        "color": "red",
-                    }
-                    if world_pos:
-                        info["world"] = (float(world_pos[0]), float(world_pos[1]))
-                    self.victims[vid] = info
-                    cv2.rectangle(annotated, (x, y), (x + wbox, y + hbox), (0, 0, 255), 2)
-                    cv2.putText(annotated, f"NEW:{vid[:6]}", (x, y-6),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-                    detections.append((vid, cx, cy, (x, y, wbox, hbox), info.get("world"), "red"))
-                    vid_to_use = vid
+            if is_new:
+                new_vid = str(uuid.uuid4())
+                self.red_victims[new_vid] = {
+                    "id": new_vid,
+                    "world": world_coords,
+                    "pixel": {"x": cx, "y": cy},
+                    "first_seen": now,
+                    "last_seen": now,
+                    "visited": False,
+                    "confidence": 0.9
+                }
+                detection_info["id"] = new_vid
+                print(f"[{self.name}] New RED victim {new_vid} detected at world={world_coords} pixel=({cx},{cy})")
+            else:
+                self.red_victims[found_vid].update(detection_info)
+                detection_info["id"] = found_vid
+            
+            detections_list.append(detection_info)
 
-                # keep a red-victim list for missions
-                vinfo = self.victims.get(vid_to_use, {})
-                if vinfo.get("color") == "red":
-                    rv = self.red_victims.get(vid_to_use, {
-                        "id": vid_to_use,
-                        "first_seen": vinfo.get("first_seen", now_ts()),
-                        "visited": False
-                    })
-                    rv["last_seen"] = now_ts()
-                    rv["pixel"] = vinfo.get("pixel")
-                    if vinfo.get("world"):
-                        rv["world"] = vinfo.get("world")
-                    self.red_victims[vid_to_use] = rv
-
-            if detections:
-                out_path = os.path.join(self.debug_dir, f"red_victim_step{step_count}.png")
+        except Exception as e:
+            print(f"[{self.name}] Error in detect_victim: {e}")
+        
+        return detections_list
+    # --- END NEW ---
+    
+    def poll_squad_messages(self):
+        msgs = []
+        try:
+            if not getattr(self, "squad_receiver", None):
+                return msgs
+            while self.squad_receiver.getQueueLength() > 0:
                 try:
-                    cv2.imwrite(out_path, annotated)
-                except Exception:
+                    if hasattr(self.squad_receiver, "getString"):
+                        raw = self.squad_receiver.getString()
+                    else:
+                        raw_bytes = self.squad_receiver.getData()
+                        try:
+                            raw = raw_bytes.decode("utf-8")
+                        except Exception:
+                            raw = str(raw_bytes)
                     try:
-                        Image.fromarray(annotated[:, :, ::-1]).save(out_path)
+                        parsed = json.loads(raw)
+                        msgs.append(parsed)
+                    except Exception:
+                        msgs.append(raw)
+                except Exception as ex:
+                    print(f"[{getattr(self,'name','robot')}] Error reading squad message: {ex}")
+                finally:
+                    try:
+                        self.squad_receiver.nextPacket()
                     except Exception:
                         pass
-
-            if detections:
-                self.persist_victims()
-
-                # announce sightings
-                for det in detections:
-                    vid, _, _, _, world, _ = det
-                    det_payload = {
-                        "type": "VICTIM_SEEN",
-                        "robot": self.name,
-                        "victim_id": vid,
-                        "pixel": self.victims[vid]["pixel"],
-                        "world": world,
-                        "color": "red",
-                        "ts": now_ts()
-                    }
-                    try:
-                        self._append_map_history("victim_seen", det_payload)
-                    except Exception:
-                        pass
-                    try:
-                        self.send_squad_message(det_payload)
-                    except Exception:
-                        pass
-
-            return detections
-
         except Exception as ex:
-            print(f"[{self.name}] Error detect_red_victims: {ex}")
-            return []
-
-    # ---------- REPULSIVE control ----------
+            print(f"[{getattr(self,'name','robot')}] poll_squad_messages outer error: {ex}")
+        return msgs
+        
     def compute_repulsive_command(self, ranges, angles):
         try:
             if ranges is None or angles is None or len(ranges) == 0:
@@ -911,21 +1206,22 @@ class Rosbot:
             print(f"[{self.name}] Error compute_repulsive_command: {ex}")
             return 0.0, 0.0
 
-    # ---------- CBF safety + recovery (with short-range integration) ----------
     def compute_safe_controls(self, v_des, omega_des, lidar_ranges):
+        """
+        Computes safe controls, using LIDAR data only.
+        """
         v = float(v_des)
         omega = float(omega_des)
 
-        # high-priority emergency backoff
+        # --- (All backoff/repulsive/short-range sensor logic remains the same) ---
         if self.emergency_backoff_steps > 0:
             self.emergency_backoff_steps -= 1
-            v_cmd = -1.6
+            v_cmd = -1.0
             omega_cmd = self._clip(1.4, -self.omega_limit, self.omega_limit)
             if self.step_count % self.debug_rate == 0:
                 print(f"[{self.name}] EMERGENCY_BACKOFF remaining={self.emergency_backoff_steps} v={v_cmd:.2f} omega={omega_cmd:.2f}")
             return v_cmd, omega_cmd
 
-        # special backoff after a victim confirmation
         if self.post_detection_backoff_steps > 0:
             self.post_detection_backoff_steps -= 1
             v_cmd = -1.3
@@ -934,9 +1230,9 @@ class Rosbot:
                 print(f"[{self.name}] POST_DET_BACKOFF remaining={self.post_detection_backoff_steps}")
             return v_cmd, omega_cmd
 
-        # repulsive recovery mode
         if self.repulsive_steps > 0:
             try:
+                # Repulsive uses LIDAR data passed in
                 angles = np.array(self._lidar_angles()) if self._lidar_angles() is not None else None
                 v_rep, w_rep = self.compute_repulsive_command(lidar_ranges, angles)
                 self.repulsive_steps -= 1
@@ -947,13 +1243,11 @@ class Rosbot:
             except Exception as ex:
                 print(f"[{self.name}] Error in repulsive mode: {ex}")
 
-        # --- short-range near-field avoidance ---
         sr = self.get_short_range_values()
         fl, fr, rl, rr = sr["fl"], sr["fr"], sr["rl"], sr["rr"]
         front_min_sr = min(fl, fr)
         rear_min_sr = min(rl, rr)
 
-        # forward motion gating
         if v > 0:
             if front_min_sr < self.sr_stop_front:
                 print(f"[{self.name}] SR FRONT STOP ({front_min_sr:.2f}m) -> EMERGENCY_BACKOFF")
@@ -964,7 +1258,6 @@ class Rosbot:
                 v *= slow_scale
                 omega += 1.1 * np.sign(fr - fl) * (1.0 - slow_scale)
 
-        # reverse motion gating
         if v < 0:
             if rear_min_sr < self.sr_stop_rear:
                 print(f"[{self.name}] SR REAR STOP ({rear_min_sr:.2f}m) -> EMERGENCY_BACKOFF")
@@ -975,19 +1268,32 @@ class Rosbot:
                 v *= slow_scale
                 omega += 1.1 * np.sign(rr - rl) * (1.0 - slow_scale)
 
-        # CBF mid-field safety
+        # --- START: REVERTED SENSOR LOGIC ---
+        
+        # If no lidar available, return clipped requested commands
         if lidar_ranges is None or self.lidar is None:
             v_ret = self._clip(v, -self.max_wheel_speed, self.max_wheel_speed)
             omega_ret = self._clip(omega, -self.omega_limit, self.omega_limit)
             return v_ret, omega_ret
+        
+        # --- END: REVERTED SENSOR LOGIC ---
 
         try:
+            # The 'ranges' variable is now always from lidar
             ranges = np.array(lidar_ranges, dtype=float)
             ranges = np.where(np.isfinite(ranges), ranges, 1e3)
-            angles = np.array(self._lidar_angles())
-            if angles is None or len(angles) != len(ranges):
-                angles = np.linspace(-math.pi/4, math.pi/4, len(ranges))
+            min_range = float(np.min(ranges))
 
+            if min_range > self.cbf_trigger_distance:
+                # Nothing close in mid-field — allow requested command
+                v_ret = self._clip(v, -self.max_wheel_speed, self.max_wheel_speed)
+                omega_ret = self._clip(omega, -self.omega_limit, self.omega_limit)
+                return v_ret, omega_ret
+
+            # angles for lidar beams
+            angles = np.array(self._lidar_angles()) if self._lidar_angles() is not None else np.linspace(-math.pi/2, math.pi/2, len(ranges))
+
+            # CBF logic
             allowed_vs = []
             for r, theta in zip(ranges, angles):
                 c = math.cos(theta)
@@ -995,31 +1301,33 @@ class Rosbot:
                     continue
                 margin = r - self.d_min
                 v_allowed = (self.cbf_alpha * margin) / (c + 1e-9)
-                if v_allowed < -2.0 * self.max_wheel_speed:
+                if v_allowed < -5.0 * self.max_wheel_speed:
                     continue
                 allowed_vs.append(v_allowed)
 
             if allowed_vs:
-                v_max_allowed = min(allowed_vs)
+                v_max_allowed = float(np.percentile(np.array(allowed_vs), self.cbf_allowed_percentile))
                 v_max_allowed = self._clip(v_max_allowed, -self.max_wheel_speed, self.max_wheel_speed)
             else:
                 v_max_allowed = self.max_wheel_speed
 
+            # Central sector check
             center_idx = len(ranges)//2
-            sector = ranges[max(0, center_idx-4): center_idx+5]
+            sector_width = max(5, len(ranges) // 10) # 10% of sensor width
+            sector = ranges[max(0, center_idx - sector_width): center_idx + sector_width + 1]
             front_min = float(np.min(sector)) if sector.size else float(np.min(ranges))
 
-            if front_min < (self.d_min * 0.6):
+            if front_min < (self.d_min * 0.5):
                 self.emergency_backoff_steps = self.emergency_backoff_duration
-                print(f"[{self.name}] STUCK: front_min={front_min:.3f} < {self.d_min*0.6:.3f} -> EMERGENCY_BACKOFF({self.emergency_backoff_steps})")
-                omega_cmd = self._clip(1.4, -self.omega_limit, self.omega_limit)
-                return -1.6, omega_cmd
+                print(f"[{self.name}] VERY CLOSE OBSTACLE -> EMERGENCY_BACKOFF front_min={front_min:.3f}")
+                return -1.6, self._clip(1.4, -self.omega_limit, self.omega_limit)
 
             if v_max_allowed < 0.0:
                 v = min(v, max(v_max_allowed, -1.8))
             else:
                 v = min(v, v_max_allowed, self.max_wheel_speed)
 
+            # Angular avoidance
             d_thresh = max(self.d_min*3.0, 1.0)
             angular_sum = 0.0
             angular_weight = 0.0
@@ -1039,8 +1347,8 @@ class Rosbot:
                     omega = 0.65 * omega_avoid + 0.35 * omega
                 else:
                     omega = 0.3 * omega_avoid + 0.7 * omega
-
-            # low-speed -> repulsive
+            
+            # Stuck/low-speed logic
             if abs(v) < self.v_low_thresh:
                 self.low_speed_count += 1
             else:
@@ -1048,10 +1356,10 @@ class Rosbot:
             if self.low_speed_count >= self.low_speed_timeout_steps:
                 self.repulsive_steps = self.repulsive_duration
                 self.low_speed_count = 0
-                print(f"[{self.name}] REPULSIVE triggered due to prolonged low v (v_max_allowed={v_max_allowed:.3f}) -> repulsive_steps={self.repulsive_steps}")
+                print(f"[{self.name}] REPULSIVE triggered due to prolonged low v -> repulsive_steps={self.repulsive_steps}")
+                # Use the current sensor data for the repulsive command
                 return self.compute_repulsive_command(ranges, angles)
 
-            # stuck-history -> repulsive
             self.stuck_front_history.append(front_min)
             if len(self.stuck_front_history) > self.stuck_history_len:
                 self.stuck_front_history.pop(0)
@@ -1060,13 +1368,9 @@ class Rosbot:
                 self.stuck_front_history = []
                 print(f"[{self.name}] STUCK_HISTORY triggered -> repulsive_steps={self.repulsive_steps}")
 
-            if self.stuck_backoff_steps > 0:
-                self.stuck_backoff_steps -= 1
-                print(f"[{self.name}] RECOVERING stuck_backoff left={self.stuck_backoff_steps}")
-                return -1.4, 1.2
-
             if self.step_count % self.debug_rate == 0:
-                print(f"[{self.name}] LIDAR front_min={front_min:.3f} v_allowed={v_max_allowed:.3f} v_cmd={v:.3f} omega={omega:.3f}")
+                sensor_name = "LIDAR"
+                print(f"[{self.name}] NAV ({sensor_name}) min_range={min_range:.3f} front_min={front_min:.3f} v_allowed={v_max_allowed:.3f} v_cmd={v:.3f} omega={omega:.3f}")
 
             omega = self._clip(omega, -self.omega_limit, self.omega_limit)
             v = self._clip(v, -self.max_wheel_speed, self.max_wheel_speed)
@@ -1077,10 +1381,7 @@ class Rosbot:
             return 0.0, 0.0
 
     # ---------- Navigation ----------
-    def navigate_to(self, target_centroid, linear_speed=3.0, angle_k=2.0, dist_tol=0.6, debug=False, consensus_mode=None):
-        """
-        consensus_mode: None / 'forward' / 'reverse'
-        """
+    def navigate_to(self, target_centroid, linear_speed=3.0, angle_k=2.0, dist_tol=0.6, debug=False):
         pos = self.get_position()
         yaw = self.get_yaw()
         v_des = linear_speed
@@ -1108,28 +1409,67 @@ class Rosbot:
             return False
 
         angle_err = self._angle_diff(yaw, desired_heading)
-
-        # Apply consensus cycle velocity rules EXACTLY as specified
-        if consensus_mode == 'forward':
-            v_des = -linear_speed * max(50.0, (1.0 - abs(angle_err)/math.pi))
-            omega_des = 0.0 if abs(angle_err) < self.heading_deadzone_rad else self._clip(angle_k * angle_err, -self.omega_limit, self.omega_limit)
-        elif consensus_mode == 'reverse':
-            v_des = linear_speed * max(50.0, (1.0 - abs(angle_err)/math.pi))
-            omega_des = 0.0 if abs(angle_err) < self.heading_deadzone_rad else self._clip(angle_k * angle_err, -self.omega_limit, self.omega_limit)
-        else:
-            omega_des = 0.0 if abs(angle_err) < self.heading_deadzone_rad else self._clip(angle_k * angle_err, -self.omega_limit, self.omega_limit)
-            v_des = -linear_speed * max(50, (1.0 - abs(angle_err)/math.pi))
+        omega_des = 0.0 if abs(angle_err) < self.heading_deadzone_rad else self._clip(angle_k * angle_err, -self.omega_limit, self.omega_limit)
+        v_des = linear_speed * max(0.2, (1.0 - abs(angle_err)/math.pi))
 
         lidar_ranges = self.get_lidar_ranges()
         v_safe, omega_safe = self.compute_safe_controls(v_des, omega_des, lidar_ranges)
 
         if debug and (self.step_count % (self.debug_rate) == 0):
-            print(f"[{self.name}] NAV_DEBUG dist={distance:.2f} yaw={yaw:.2f} angle_err={angle_err:.2f} v_des={v_des:.2f} v_safe={v_safe:.2f} omega_safe={omega_safe:.2f} consensus_mode={consensus_mode}")
+            print(f"[{self.name}] NAV_DEBUG dist={distance:.2f} yaw={yaw:.2f} angle_err={angle_err:.2f} v_des={v_des:.2f} v_safe={v_safe:.2f} omega_safe={omega_safe:.2f}")
 
         self._apply_wheel_cmds(v_safe, omega_safe)
         return False
 
-    # ---------- Consensus helpers ----------
+    def compute_inverted_command(self, linear_speed=4.0, angle_k=2.0):
+        pos = self.get_position()
+        yaw = self.get_yaw()
+        if pos is None or yaw is None:
+            return linear_speed, 0.0
+
+        sum_x = 0.0
+        sum_y = 0.0
+        count = 0
+        now = now_ts()
+        for name, (x, y, ts) in list(self.received_poses.items()):
+            if name == self.name:
+                continue
+            if now - float(ts) > 10.0:
+                continue
+            dx = pos[0] - float(x)
+            dy = pos[1] - float(y)
+            dist = math.hypot(dx, dy)
+            if dist < 1e-6:
+                continue
+            w = min(1.0, 1.0 / (dist + 1e-3))
+            sum_x += w * (dx / dist)
+            sum_y += w * (dy / dist)
+            count += 1
+
+        if count == 0 or (abs(sum_x) < 1e-6 and abs(sum_y) < 1e-6):
+            return linear_speed, 0.0
+
+        away_heading = math.atan2(sum_y, sum_x)
+        for dist_m in (2.0, 4.0, 6.0, 8.0, 10.0):
+            cand_x = pos[0] + dist_m * math.cos(away_heading)
+            cand_y = pos[1] + dist_m * math.sin(away_heading)
+            cell = self.world_to_cell((cand_x, cand_y))
+            combined = self.get_combined_explored()
+            if cell is None:
+                continue
+            if cell not in combined:
+                desired_heading = math.atan2(cand_y - pos[1], cand_x - pos[0])
+                angle_err = self._angle_diff(yaw, desired_heading)
+                omega_des = 0.0 if abs(angle_err) < self.heading_deadzone_rad else self._clip(angle_k * angle_err, -self.omega_limit, self.omega_limit)
+                v_des = linear_speed * max(0.2, (1.0 - abs(angle_err)/math.pi))
+                return v_des, omega_des
+
+        angle_err = self._angle_diff(yaw, away_heading)
+        omega_des = 0.0 if abs(angle_err) < self.heading_deadzone_rad else self._clip(angle_k * angle_err, -self.omega_limit, self.omega_limit)
+        v_des = linear_speed * max(0.2, (1.0 - abs(angle_err)/math.pi))
+        return v_des, omega_des
+
+    # ---------- Consensus helpers (simplified rendezvous) ----------
     def broadcast_pose(self):
         pos = self.get_position()
         if pos is None:
@@ -1156,8 +1496,7 @@ class Rosbot:
         except Exception:
             pass
 
-    def compute_consensus_target(self, freshness_s=6.0, force=False):
-        """Compute centroid of currently-known poses."""
+    def compute_consensus_target(self, freshness_s=6.0, min_robots=2):
         try:
             now = now_ts()
             poses = []
@@ -1172,9 +1511,7 @@ class Rosbot:
                         pass
                     continue
                 poses.append((float(x), float(y)))
-            if len(poses) < self.consensus_min_robots and not force:
-                return None
-            if len(poses) == 0:
+            if len(poses) < min_robots:
                 return None
             sx = sum(p[0] for p in poses) / float(len(poses))
             sy = sum(p[1] for p in poses) / float(len(poses))
@@ -1185,7 +1522,6 @@ class Rosbot:
 
     # ---------- Victim mission helpers ----------
     def _nearest_unvisited_red_victim(self):
-        """Return (vid, world_xy) of closest unvisited red victim with a known world position."""
         pos = self.get_position()
         if pos is None:
             return None
@@ -1212,126 +1548,112 @@ class Rosbot:
         self.persist_victims()
 
     def _notify_supervisor_detected(self, vid, world_xy=None):
+        # This function is from proposed_solution and sends a *different*
+        # message type ("VICTIM_DETECTED") than the simple supervisor expects.
+        # We will use send_decision_request instead.
+        # This function can be kept for a more advanced supervisor.
+        
+        vinfo = self.victims.get(vid, {})
+        pos = self.get_position()
+        dist = None
+        if pos and world_xy:
+            try:
+                dist = float(math.hypot(pos[0]-world_xy[0], pos[1]-world_xy[1]))
+            except Exception:
+                dist = None
+    
+        if dist is None:
+            print(f"[{self.name}] NOT notifying supervisor: distance unknown for victim {vid} (world={world_xy})")
+            return False
+    
+        # The simple supervisor checks proximity, so we don't need this check
+        # if not (dist < 1.0):
+        #     print(f"[{self.name}] NOT notifying supervisor: distance {dist:.3f} >= 1.0m for victim {vid}")
+        #     return False
+    
         payload = {
-            "type": "VICTIM_DETECTED",
+            "type": "VICTIM_DETECTED", # This is the complex message type
             "robot": self.name,
             "victim_id": vid,
             "world": list(world_xy) if world_xy else None,
             "color": "red",
+            "victim_confidence": float(vinfo.get("confidence", 0.0)),
+            "distance_to_victim": float(dist),
+            "robot_pos": [float(pos[0]), float(pos[1])],
             "ts": now_ts()
         }
-        self.send_supervisor_message(payload)
+        # We send this *in addition* to the simple request
+        ok = self.send_supervisor_message(payload)
+        print(f"[{self.name}] Supervisor notify (COMPLEX) vid={vid} dist={dist:.3f} sent={ok}")
         self._append_map_history("victim_detected_confirmed", payload)
-        print(f"[{self.name}] Supervisor notified: {payload}")
+        return ok
 
     # greedy pixel-centering control (fallback when no world/depth)
     def greedy_pursue_pixel(self, cx, w_img, base_speed=2.0):
-        # pixel error from center -> yaw command; small forward speed under safety
         center = w_img / 2.0
-        ex = (cx - center) / float(w_img)  # -0.5..0.5
-        omega_des = 4.0 * ex  # turn toward blob
+        ex = (cx - center) / float(w_img)
+        omega_des = 4.0 * ex
         v_des = base_speed * max(0.3, 1.0 - abs(ex))
         lidar_ranges = self.get_lidar_ranges()
         v_safe, omega_safe = self.compute_safe_controls(v_des, omega_des, lidar_ranges)
         self._apply_wheel_cmds(v_safe, omega_safe)
 
-    # rest of controller helpers (sensors, comms, map code)
-    def poll_squad_messages(self):
-        msgs = []
-        if not self.squad_receiver:
-            return msgs
-        while self.squad_receiver.getQueueLength() > 0:
-            try:
-                if hasattr(self.squad_receiver, "getString"):
-                    raw = self.squad_receiver.getString()
-                else:
-                    raw_bytes = self.squad_receiver.getData()
-                    try:
-                        raw = raw_bytes.decode("utf-8")
-                    except Exception:
-                        raw = str(raw_bytes)
-                try:
-                    parsed = json.loads(raw)
-                    msgs.append(parsed)
-                except Exception:
-                    msgs.append(raw)
-            except Exception as ex:
-                print(f"[{self.name}] Error reading squad message: {ex}")
-            finally:
-                try:
-                    self.squad_receiver.nextPacket()
-                except Exception:
-                    pass
-        return msgs
-
-    def poll_supervisor_messages(self):
-        msgs = []
-        if not self.supervisor_receiver:
-            return msgs
-        while self.supervisor_receiver.getQueueLength() > 0:
-            try:
-                if hasattr(self.supervisor_receiver, "getString"):
-                    raw = self.supervisor_receiver.getString()
-                else:
-                    raw_bytes = self.supervisor_receiver.getData()
-                    try:
-                        raw = raw_bytes.decode("utf-8")
-                    except Exception:
-                        raw = str(raw_bytes)
-                try:
-                    parsed = json.loads(raw)
-                    msgs.append(parsed)
-                except Exception:
-                    msgs.append(raw)
-            except Exception as ex:
-                print(f"[{self.name}] Error reading supervisor msg: {ex}")
-            finally:
-                try:
-                    self.supervisor_receiver.nextPacket()
-                except Exception:
-                    pass
-        return msgs
-
     def save_rgb_frame(self, step_count):
-        if not self.camera_rgb:
-            return
-        buf = self.camera_rgb.getImage()
-        w, h = self.camera_rgb.getWidth(), self.camera_rgb.getHeight()
-        img = np.frombuffer(buf, dtype=np.uint8).reshape((h, w, 4))
-        rgb = img[:, :, :3][:, :, ::-1]
+        rgb = self.get_rgb_image()
+        if rgb is None: return
         Image.fromarray(rgb).save(os.path.join(self.debug_dir, f"rgb_step{step_count}.png"))
 
     def save_depth_frame(self, step_count):
-        if not self.camera_depth:
-            return
-        depth = np.array(self.camera_depth.getRangeImage(), dtype=np.float32).reshape(
-            (self.camera_depth.getHeight(), self.camera_depth.getWidth()))
+        depth = self.get_depth_image()
+        if depth is None: return
         dmin = self.camera_depth.getMinRange()
         dmax = self.camera_depth.getMaxRange()
         norm = ((np.clip(depth, dmin, dmax) - dmin) / (dmax - dmin) * 255).astype(np.uint8)
         Image.fromarray(norm).save(os.path.join(self.debug_dir, f"depth_step{step_count}.png"))
 
     def read_sensors(self):
-        gps = self.gps.getValues() if self.gps else None
-        imu = self.get_inertial_quaternion()
-        print(f"[{self.name}] SENSORS gps={gps} imu={imu}")
+        gps_val = self.gps.getValues() if self.gps else None
+        imu_val = self.get_inertial_quaternion()
+        print(f"[{self.name}] SENSORS gps={gps_val} imu={imu_val}")
 
 
 # --- Main loop ---
 def main():
     bot = Rosbot()
+    print("has poll_squad_messages?", hasattr(bot, "poll_squad_messages"))
+
     try:
         bot.calibrate_yaw_sign()
     except Exception:
         pass
 
     step = 0
-    forward_speed = 6.0  # nominal forward command (tune)
+    forward_speed = 6.0
     print(f"[{bot.name}] START")
 
     while bot.robot.step(bot.timestep) != -1:
         step += 1
         bot.step_count = step
+
+        # --- MODIFIED: Removed the "stop-and-wait" logic ---
+        # We only poll for responses, but we don't stop
+        if bot.action_pending:
+            approval_status = bot.handle_supervisor_response() 
+            # We don't do anything with the status, just clear the flag
+        
+        # If we ARE in a wait state (e.g. from an old request),
+        # clear it immediately. We no longer wait.
+        if bot.state == RobotState.WAITING_APPROVAL:
+             bot.state = RobotState.EXPLORING
+             bot.action_pending = False
+        # --- END MODIFICATION ---
+
+        # broadcast pose
+        if step % bot.pose_bcast_steps == 0:
+            try:
+                bot.broadcast_pose()
+            except Exception:
+                pass
 
         # process squad messages
         msgs = bot.poll_squad_messages()
@@ -1341,18 +1663,21 @@ def main():
                     bot.merge_graph_summary(m)
                 if isinstance(m, dict) and m.get("type") == "POSE":
                     bot.update_received_pose(m)
+                if isinstance(m, dict) and m.get("type") == "EXPLORED_UPDATE":
+                    bot.merge_remote_explored(m.get("robot", "unknown"), m.get("cells", []))
             except Exception as ex:
                 print(f"[{bot.name}] msg err {ex}")
 
-        # supervisor messages (debug)
-                # supervisor messages: handle approvals/rejections properly
-        sv = bot.poll_supervisor_messages()
-        for sm in sv:
-            try:
-                bot.handle_supervisor_response(sm)
-            except Exception as ex:
-                print(f"[{bot.name}] SUP handle err {ex}")
+        # expire old explored entries
+        if step % (bot.pose_bcast_steps * 4) == 0:
+            bot.expire_old_explored()
 
+        # periodically broadcast explored cells
+        if (now_ts() - bot.last_explored_bcast) >= bot.explored_bcast_interval_s:
+            try:
+                bot.broadcast_explored_update()
+            except Exception:
+                pass
 
         if step % 10 == 0:
             bot.read_sensors()
@@ -1361,9 +1686,10 @@ def main():
             bot.save_rgb_frame(0)
             bot.save_depth_frame(0)
 
-        # --- HARD BARRIER position-based anti-stuck (2s) ---
+        # HARD BARRIER position-based anti-stuck
         pos = bot.get_position()
         if pos is not None:
+            bot.mark_explored_world_area(pos, radius=bot.explore_mark_radius)
             if bot.stuck_last_pos is None:
                 bot.stuck_last_pos = pos
                 bot.stuck_last_moved_ts = now_ts()
@@ -1382,45 +1708,77 @@ def main():
                             bot.repulsive_steps = max(bot.repulsive_steps, bot.repulsive_duration)
                             print(f"[{bot.name}] HARD_BARRIER: pos unchanged > {bot.stuck_hard_window_s:.1f}s -> EMERGENCY_BACKOFF + REPULSIVE")
 
-        # periodic RED victim detection
-        detections = []
+        
+        # --- NEW: Periodic OpenCV RED victim detection ---
+        detections = [] # Reset detections list
         if step % bot.victim_check_interval == 0:
             try:
-                detections = bot.detect_red_victims(step)
-                if detections:
-                    print(f"[{bot.name}] Red victim detections: {len(detections)}")
-                    for det in detections:
-                        vid, px, py, bbox, world, color = det
-                        print(f" - {vid} px=({px},{py}) bbox={bbox} color={color} world={world}")
+                # This function now uses OpenCV, updates self.red_victims,
+                # and returns a list of detections for greedy-pixel updates
+                detections = bot.detect_victim()
             except Exception as ex:
                 print(f"[{bot.name}] red victim detect err: {ex}")
+        # --- END NEW ---
+        
+        current_time = bot.robot.getTime()
+        if (current_time - bot.last_decision_time > bot.decision_interval) and not bot.action_pending:
+            # Only send a periodic request if we are NOT currently on a victim mission
+            if bot.current_victim_id is None:
+                action_name = "explore_forward" 
+                
+                # Check the bot's actual current task
+                if bot.current_task == "navigate:consensus":
+                    action_name = "return_to_rendezvous"
+                elif bot.current_task == "navigate:explore_cell":
+                    action_name = "explore_forward"
+                elif bot.current_task is None and not in_rendezvous_window:
+                    # If no task and after rendezvous, we are in "inverted rendezvous"
+                    action_name = "explore_forward" # We'll just call this "explore"
+                
+                reason = bot.generate_explanation(action_name)
+                bot.send_decision_request(
+                    action_name,  # <-- Use the honest action_name
+                    reason, 
+                    victim_detected=False, 
+                    confidence=0.0, 
+                    wait_for_approval=False
+                )
+                bot.last_decision_time = current_time
 
+        # --- MODIFIED: Re-activated VICTIM-FIRST logic ---
         # ---------------------------
         # VICTIM-FIRST: preempt EVERYTHING
         # ---------------------------
-        # If any red victim exists, start/continue mission immediately.
-        # 1) If we have a current victim with world -> navigate there.
-        # 2) Else pick nearest with world. If none has world, go GREEDY to the freshest pixel.
         victim_available = bool(bot.red_victims)
         if victim_available:
-            # cancel any consensus
-            if bot.consensus_active or bot.current_task == "navigate:consensus":
-                print(f"[{bot.name}] VICTIM preempts consensus -> cancel current consensus attempt")
-                bot.consensus_active = False
-                bot.consensus_target = None
-                bot.consensus_motion_mode = None
+            if bot.current_task and bot.current_task.startswith("navigate"):
                 bot.current_task = None
                 bot.task_target = None
 
-            # lock onto a specific victim if not already
             if bot.current_victim_id is None:
                 nv = bot._nearest_unvisited_red_victim()
                 if nv is not None:
                     bot.current_victim_id, bot.task_target = nv[0], nv[1]
                     bot.current_task = "navigate:victim"
                     print(f"[{bot.name}] VICTIM mission start -> {bot.current_victim_id} @ {bot.task_target}")
+
+                    # --- NEW: Report to Supervisor (as requested) ---
+                    try:
+                        v_info = bot.red_victims.get(bot.current_victim_id, {})
+                        v_conf = v_info.get("confidence", 0.9) 
+                        reason = bot.generate_explanation("investigate_victim")
+                        
+                        # Send the request, but DO NOT wait for approval
+                        bot.send_decision_request(
+                            "investigate_victim", reason, True, v_conf, wait_for_approval=False
+                        )
+                        bot.last_victim_report_time = bot.robot.getTime()
+                    except Exception as e:
+                        print(f"[{bot.name}] Error reporting victim to supervisor: {e}")
+                    # --- END NEW ---
+                
                 else:
-                    # no world coords yet — use greedy on the most recent pixel
+                    # no world coords yet — use greedy on freshest pixel
                     freshest_id = None
                     freshest_ts = -1
                     px_center = None
@@ -1444,42 +1802,42 @@ def main():
         # If we are on a victim mission
         if bot.current_victim_id is not None:
             rv = bot.red_victims.get(bot.current_victim_id, {})
-            # refresh greedy pixel if a new detection came
+            
+            # Refresh greedy pixel if a new detection came
             if detections:
                 for det in detections:
-                    vid, px, py, bbox, world, color = det
-                    if vid == bot.current_victim_id and rv.get("pixel"):
-                        bot.greedy_target_px = rv["pixel"]["x"]
+                    vid = det.get("id")
+                    if vid == bot.current_victim_id and det.get("pixel"):
+                        bot.greedy_target_px = det["pixel"]["x"]
                         bot.greedy_last_seen_ts = now_ts()
 
-            # If we have a world target -> navigate gently and confirm within 1m
+            # If we have a world target -> navigate gently and confirm within tol
             if rv.get("world"):
                 bot.task_target = rv["world"]
                 bot.current_task = "navigate:victim"
                 reached = bot.navigate_to(bot.task_target, linear_speed=3.2, angle_k=2.0,
-                                          dist_tol=bot.victim_target_tol_m, debug=True, consensus_mode=None)
+                                          dist_tol=bot.victim_target_tol_m, debug=True)
 
                 if reached:
-                    # Confirm & notify supervisor
+                    # --- MODIFIED: Use _notify_supervisor_detected ---
+                    # This sends the "VICTIM_DETECTED" message for complex supervisors
                     bot._notify_supervisor_detected(bot.current_victim_id, bot.task_target)
+                    # --- END MODIFICATION ---
                     bot._mark_victim_visited(bot.current_victim_id)
-                    # Back off to clear space and continue search
                     bot.post_detection_backoff_steps = bot.post_detection_backoff_duration
-                    # clear victim mission
                     bot.current_victim_id = None
                     bot.current_task = None
                     bot.task_target = None
-                    # Produce a command this step (safety/backoff handled in compute_safe_controls)
                     lidar_ranges = bot.get_lidar_ranges()
                     v_safe, w_safe = bot.compute_safe_controls(0.0, 0.0, lidar_ranges)
                     bot._apply_wheel_cmds(v_safe, w_safe)
                     continue
+                continue
             else:
                 # GREEDY pixel-centering pursuit
                 if bot.greedy_active and bot.greedy_target_px is not None and bot.camera_rgb is not None:
                     w_img = bot.camera_rgb.getWidth()
                     bot.greedy_pursue_pixel(bot.greedy_target_px, w_img, base_speed=2.2)
-                    # timeout if not updated
                     if (now_ts() - bot.greedy_last_seen_ts) > bot.greedy_timeout_s:
                         print(f"[{bot.name}] GREEDY timeout -> releasing victim lock")
                         bot.greedy_active = False
@@ -1488,119 +1846,74 @@ def main():
                         bot.task_target = None
                     continue
                 else:
-                    # no pixel to pursue; release lock
                     bot.current_victim_id = None
                     bot.current_task = None
                     bot.task_target = None
+        # --- END VICTIM-FIRST BLOCK ---
+
 
         # -------------------------
-        # Consensus cycle management (only if not in victim mission)
+        # Rendezvous (first window) -> Inverted rendezvous after timeout or reach
         # -------------------------
-                # Only run consensus logic when there is no active victim
-        if bot.current_victim_id is None:
-            phase = bot.update_consensus_cycle()
-
-            if phase in ("forward_active", "reverse_active"):
-                # reset inactive timer (we are active)
-                bot.consensus_inactive_since = None
-
-                bot.consensus_motion_mode = 'forward' if phase == "forward_active" else 'reverse'
-                if not bot.consensus_active:
-                    cand = bot.compute_consensus_target(freshness_s=bot.startup_window_s + 1.0, force=True)
-                    if cand is not None:
-                        bot.consensus_target = cand
-                        bot.current_task = "navigate:consensus"
-                        bot.task_target = cand
-                        bot.consensus_active = True
-                        bot.consensus_started_ts = now_ts()
-                        bot._append_map_history("consensus_start", {"target": cand, "participants": len(bot.received_poses), "phase": phase})
-                        print(f"[{bot.name}] CONSENSUS cycle START ({phase}) -> target={cand}")
-                # else: already active — keep running
-
-            else:  # phase == "inactive"
-                # Start or update the inactive timer when we first see an inactive phase
-                if bot.consensus_active:
-                    if bot.consensus_inactive_since is None:
-                        bot.consensus_inactive_since = now_ts()
-                        # keep consensus running for the grace period
-                    else:
-                        # if inactive persisted beyond grace period, cancel consensus
-                        if now_ts() - bot.consensus_inactive_since > bot.consensus_inactive_grace_s:
-                            print(f"[{bot.name}] CONSENSUS cycle CANCEL (inactive persisted > {bot.consensus_inactive_grace_s}s)")
-                            bot.consensus_active = False
-                            bot.consensus_target = None
-                            bot.consensus_motion_mode = None
-                            bot.consensus_inactive_since = None
-                            if bot.current_task == "navigate:consensus":
-                                bot.current_task = None
-                                bot.task_target = None
-                # if consensus not active, nothing to cancel — keep waiting
-
-
-        # Behavior manager: navigation to task targets (including consensus)
-        if bot.current_victim_id is None and bot.current_task and bot.current_task.startswith("navigate:") and bot.task_target:
-            tol = bot.consensus_tolerance if bot.current_task == "navigate:consensus" else 0.6
-            consensus_mode = bot.consensus_motion_mode if bot.current_task == "navigate:consensus" else None
-            reached = bot.navigate_to(bot.task_target, linear_speed=forward_speed, angle_k=2.0,
-                                      dist_tol=tol, debug=True, consensus_mode=consensus_mode)
-            if reached:
-                nid = bot.current_task.split(":", 1)[1]
-                bot._append_map_history("arrived_node", {"node": nid})
-                if nid == "consensus" or bot.current_task == "navigate:consensus":
-                    try:
-                        payload = {"type": "GRAPH_SUMMARY", "robot": bot.name,
-                                   "nodes": [{"id": n, "centroid": c} for n, c in bot.nodes.items()]}
-                        bot.send_squad_message(payload)
-                    except Exception:
-                        pass
-                    bot._append_map_history("consensus_arrived", {"target": bot.task_target})
-                    bot.consensus_active = False
-                    bot.consensus_target = None
-                    bot.consensus_motion_mode = None
-                bot.current_task = None
-                bot.task_target = None
-            else:
-                if bot.consensus_active and bot.consensus_started_ts and now_ts() - bot.consensus_started_ts > bot.consensus_timeout_s:
-                    print(f"[{bot.name}] CONSENSUS timeout, aborting this attempt")
-                    bot.consensus_active = False
-                    bot.consensus_target = None
-                    bot.current_task = None
-                    bot.task_target = None
-            # proceed to next loop
-            continue
-
-        # avoid exiting area if such routine exists
-        def_exited = False
-        try:
-            def_exited = bot.avoid_exiting_and_face_nearest_node(bot.get_lidar_ranges()) if hasattr(bot, "avoid_exiting_and_face_nearest_node") else False
-        except Exception:
-            def_exited = False
-        if def_exited:
-            continue
-
-        # assign to nearest node eventually (existing logic)
-        if bot.current_victim_id is None and bot.current_task is None and bot.nodes:
-            pos2 = bot.get_position()
-            if pos2:
-                nearest = None
-                nearest_d = float("inf")
-                for nid, c in bot.nodes.items():
-                    dx = float(c[0]) - pos2[0]
-                    dy = float(c[1]) - pos2[1]
-                    d = math.hypot(dx, dy)
-                    if d < nearest_d:
-                        nearest_d = d
-                        nearest = (nid, c)
-                if nearest:
-                    nid, centroid = nearest
-                    disc = bot.node_discovery_times.get(nid, 0)
-                    if now_ts() - disc >= bot.assignment_delay and nearest_d > 0.8:
-                        bot.current_task = f"navigate:{nid}"
-                        bot.task_target = centroid
-                        bot._append_map_history("assign_navigate", {"node": nid})
+        in_rendezvous_window = (now_ts() - bot.start_time) <= bot.rendezvous_window_s
+        if in_rendezvous_window:
+            centroid = bot.compute_consensus_target(freshness_s=6.0, min_robots=2)
+            if centroid:
+                cell = bot.world_to_cell(centroid)
+                combined = bot.get_combined_explored()
+                if cell is not None and cell in combined:
+                    target_cell = bot.find_nearest_unexplored_cell(max_radius_cells=40)
+                    if target_cell is not None:
+                        target_world = bot.cell_to_world_center(target_cell)
+                        bot.current_task = "navigate:explore_cell"
+                        bot.task_target = target_world
+                        reached = bot.navigate_to(bot.task_target, linear_speed=forward_speed, angle_k=2.0, dist_tol=0.8, debug=True)
+                        if reached:
+                            bot.mark_explored_world_area(target_world, radius=bot.explore_mark_radius)
+                            bot.current_task = None
+                            bot.task_target = None
                         continue
+                    else:
+                        lidar_ranges = bot.get_lidar_ranges()
+                        v_safe, omega_safe = bot.compute_safe_controls(forward_speed, 0.0, lidar_ranges)
+                        bot._apply_wheel_cmds(v_safe, omega_safe)
+                        continue
+                else:
+                    bot.current_task = "navigate:consensus"
+                    bot.task_target = centroid
+                    reached = bot.navigate_to(bot.task_target, linear_speed=4.0, angle_k=2.0, dist_tol=0.8, debug=True)
+                    if reached:
+                        bot.rendezvous_reached = True
+                        bot.current_task = None
+                        bot.task_target = None
+                        bot._append_map_history("rendezvous_reached", {"target": centroid})
+                    continue
+            else:
+                target_cell = bot.find_nearest_unexplored_cell(max_radius_cells=40)
+                if target_cell is not None:
+                    target_world = bot.cell_to_world_center(target_cell)
+                    bot.current_task = "navigate:explore_cell"
+                    bot.task_target = target_world
+                    reached = bot.navigate_to(bot.task_target, linear_speed=3.6, angle_k=2.0, dist_tol=0.8, debug=True)
+                    if reached:
+                        bot.mark_explored_world_area(target_world, radius=bot.explore_mark_radius)
+                        bot.current_task = None
+                        bot.task_target = None
+                    continue
+                else:
+                    lidar_ranges = bot.get_lidar_ranges()
+                    v_safe, omega_safe = bot.compute_safe_controls(forward_speed, 0.0, lidar_ranges)
+                    bot._apply_wheel_cmds(v_safe, omega_safe)
+                    continue
+        else:
+            # After rendezvous window -> inverted rendezvous mode (move away)
+            v_des, omega_des = bot.compute_inverted_command(linear_speed=4.0, angle_k=2.0)
+            lidar_ranges = bot.get_lidar_ranges()
+            v_safe, omega_safe = bot.compute_safe_controls(v_des, omega_des, lidar_ranges)
+            bot._apply_wheel_cmds(v_safe, omega_safe)
+            continue
 
-        # default exploration under safety layer (forward)
+        # default (shouldn't reach here) safe forward
         lidar_ranges = bot.get_lidar_ranges()
         v_safe, omega_safe = bot.compute_safe_controls(forward_speed, 0.0, lidar_ranges)
         bot._apply_wheel_cmds(v_safe, omega_safe)
